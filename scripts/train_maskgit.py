@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import os
 from pathlib import Path
@@ -9,8 +11,8 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
-import torchvision.transforms as transforms
 
+from elt.core import MASKGIT_SCALES, linear_curriculum
 from elt.maskgit.config import ELTConfig
 from elt.maskgit.dataset import CachedTokenDataset, ImageNet100Dataset, TokenDataset, random_masking
 from elt.maskgit.losses import ILSD_train_step
@@ -19,15 +21,19 @@ from elt.maskgit.tokenizer import load_tokenizer
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train MaskGIT-based ELT")
+    p = argparse.ArgumentParser(description="Train Paper-Complete MaskGIT Image ELT")
     p.add_argument("--data-dir", type=str, default="./data/imagenet100")
     p.add_argument("--vqgan-ckpt", type=str, default="./ckpts/maskgit-vqgan-imagenet-f16-256.bin")
     p.add_argument("--cache-path", type=str, default="./cache/imagenet100_tokens_train.pt")
     p.add_argument("--ckpt-dir", type=str, default="./checkpoints/maskgit")
-    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--scale", type=str, default="L", choices=sorted(MASKGIT_SCALES))
+    p.add_argument("--num-classes", type=int, default=1000)
+    p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--epochs", type=int, default=270)
-    p.add_argument("--n-unique-layers", type=int, default=3)
+    p.add_argument("--n-unique-layers", type=int, default=8)
     p.add_argument("--l-max", type=int, default=4)
+    p.add_argument("--grad-checkpoint", action="store_true")
+    p.add_argument("--no-ilsd", action="store_true")
     return p.parse_args()
 
 
@@ -43,8 +49,7 @@ def main() -> None:
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
     else:
-        local_rank = 0
-        rank = 0
+        local_rank = rank = 0
         world_size = 1
         device = torch.device(
             "cuda"
@@ -54,20 +59,22 @@ def main() -> None:
             else "cpu"
         )
 
-    cfg = ELTConfig(
-        d_model=768,
-        n_heads=12,
-        d_ff=3072,
+    cfg = ELTConfig.from_scale(
+        scale=args.scale,
         n_unique_layers=args.n_unique_layers,
         L_max=args.l_max,
+        num_classes=args.num_classes,
         batch_size=args.batch_size,
         total_epochs=args.epochs,
+        grad_checkpoint=args.grad_checkpoint,
     )
 
     Path(args.cache_path).parent.mkdir(parents=True, exist_ok=True)
     Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
 
     if rank == 0 and not os.path.exists(args.cache_path):
+        import torchvision.transforms as transforms
+
         print("rank 0: encoding dataset...")
         vqgan = load_tokenizer(device, ckpt_path=args.vqgan_ckpt)
         train_transforms = transforms.Compose(
@@ -105,17 +112,17 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    model: torch.nn.Module = ELTModel(cfg).to(device)
-    head: torch.nn.Module = MLMHead(cfg).to(device)
-    if is_ddp:
-        model = DDP(model, device_ids=[local_rank])
-        head = DDP(head, device_ids=[local_rank])
+    base_model = ELTModel(cfg).to(device)
+    base_head = MLMHead(cfg, embed_weight=base_model.token_embedding.weight).to(device)
+    model: torch.nn.Module = DDP(base_model, device_ids=[local_rank]) if is_ddp else base_model
+    head: torch.nn.Module = DDP(base_head, device_ids=[local_rank]) if is_ddp else base_head
 
+    seen = {id(p): p for p in list(base_model.parameters()) + list(base_head.parameters())}
     optimizer = torch.optim.AdamW(
-        list(model.parameters()) + list(head.parameters()),
+        list(seen.values()),
         lr=cfg.lr,
         weight_decay=cfg.weight_decay,
-        betas=(0.9, 0.96),
+        betas=cfg.betas,
     )
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
@@ -131,16 +138,27 @@ def main() -> None:
         model.train()
         head.train()
 
-        for batch_tokens, _ in train_loader:
+        for batch_tokens, batch_labels in train_loader:
             batch_tokens = batch_tokens.to(device)
-            lambda_val = max(0.0, 1.0 - global_step / total_steps)
-            masked_tokens, _, mask = random_masking(batch_tokens, cfg)
+            batch_labels = batch_labels.to(device, dtype=torch.long)
+            lambda_val = linear_curriculum(
+                global_step, total_steps, cfg.lambda_start, cfg.lambda_end
+            )
+            masked_tokens, targets, mask = random_masking(batch_tokens, cfg)
 
             loss, l_int = ILSD_train_step(
-                model, head, masked_tokens, batch_tokens, mask, lambda_val, cfg
+                model,
+                head,
+                masked_tokens,
+                targets,
+                mask,
+                lambda_val,
+                cfg,
+                labels=batch_labels,
+                use_ilsd=(not args.no_ilsd),
             )
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -156,13 +174,12 @@ def main() -> None:
                 )
 
         if rank == 0 and epoch % 10 == 0:
-            raw_model = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
-            raw_head = head.module.state_dict() if hasattr(head, "module") else head.state_dict()
             torch.save(
                 {
                     "epoch": epoch,
-                    "model": raw_model,
-                    "head": raw_head,
+                    "config": cfg,
+                    "model": base_model.state_dict(),
+                    "head": base_head.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "step": global_step,
                 },

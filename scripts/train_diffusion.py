@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import datetime
 import os
@@ -10,8 +12,8 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
-import torchvision.transforms as transforms
 
+from elt.core import DIT_SCALES, linear_curriculum
 from elt.diffusion.config import DiffusionELTConfig
 from elt.diffusion.dataset import CachedLatentDataset, ImageNet100Dataset, LatentDataset
 from elt.diffusion.inference import NoiseScheduler
@@ -21,14 +23,18 @@ from elt.diffusion.vae import load_vae
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train Diffusion-based ELT")
+    p = argparse.ArgumentParser(description="Train Paper-Complete Diffusion ELT (DiT + ILSD)")
     p.add_argument("--data-dir", type=str, default="./data/imagenet100")
     p.add_argument("--cache-path", type=str, default="./cache/imagenet100_latents_train.pt")
     p.add_argument("--ckpt-dir", type=str, default="./checkpoints/diffusion")
-    p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--epochs", type=int, default=500)
-    p.add_argument("--n-unique-layers", type=int, default=3)
+    p.add_argument("--scale", type=str, default="Large", choices=sorted(DIT_SCALES))
+    p.add_argument("--num-classes", type=int, default=1000)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--n-unique-layers", type=int, default=8)
     p.add_argument("--l-max", type=int, default=4)
+    p.add_argument("--grad-checkpoint", action="store_true")
+    p.add_argument("--no-ilsd", action="store_true", help="Disable ILSD (vanilla looping ablation)")
     p.add_argument("--compile", action="store_true")
     return p.parse_args()
 
@@ -45,8 +51,7 @@ def main() -> None:
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
     else:
-        local_rank = 0
-        rank = 0
+        local_rank = rank = 0
         world_size = 1
         device = torch.device(
             "cuda"
@@ -61,20 +66,22 @@ def main() -> None:
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
 
-    dcfg = DiffusionELTConfig(
-        d_model=768,
-        n_heads=12,
-        d_ff=3072,
+    dcfg = DiffusionELTConfig.from_scale(
+        scale=args.scale,
         n_unique_layers=args.n_unique_layers,
         L_max=args.l_max,
+        num_classes=args.num_classes,
         batch_size=args.batch_size,
         total_epochs=args.epochs,
+        grad_checkpoint=args.grad_checkpoint,
     )
 
     Path(args.cache_path).parent.mkdir(parents=True, exist_ok=True)
     Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
 
     if rank == 0 and not os.path.exists(args.cache_path):
+        import torchvision.transforms as transforms
+
         print("rank 0: encoding dataset...")
         vae = load_vae(device)
         train_transforms = transforms.Compose(
@@ -97,14 +104,14 @@ def main() -> None:
         dist.barrier()
 
     cache = torch.load(args.cache_path, map_location="cpu")
-    train_token_dataset = CachedLatentDataset(cache["latents"], cache["labels"])
+    train_dataset = CachedLatentDataset(cache["latents"], cache["labels"])
     train_sampler = (
-        DistributedSampler(train_token_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
         if is_ddp
         else None
     )
     train_loader = DataLoader(
-        train_token_dataset,
+        train_dataset,
         batch_size=dcfg.batch_size,
         sampler=train_sampler,
         shuffle=(train_sampler is None),
@@ -122,7 +129,7 @@ def main() -> None:
         list(model.parameters()),
         lr=dcfg.lr,
         weight_decay=dcfg.weight_decay,
-        betas=(0.9, 0.96),
+        betas=dcfg.betas,
         fused=(device.type == "cuda"),
     )
     use_amp = device.type == "cuda"
@@ -141,17 +148,23 @@ def main() -> None:
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         model.train()
-        for batch_latents, _ in train_loader:
+        for batch_latents, batch_labels in train_loader:
             batch_latents = batch_latents.to(device)
-            t = torch.randint(0, dcfg.T, (batch_latents.shape[0],), device=device)
-            epsilon = torch.randn_like(batch_latents)
-            x_t = noise_scheduler.add_noise(batch_latents, t, epsilon)
-            lambda_val = max(0.0, 1.0 - (global_step / total_steps))
+            batch_labels = batch_labels.to(device, dtype=torch.long)
+            lambda_val = linear_curriculum(
+                global_step, total_steps, dcfg.lambda_start, dcfg.lambda_end
+            )
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
                 loss_total, l_int = diff_ILSD_train_step(
-                    model, x_t, t, epsilon, lambda_val, dcfg
+                    model,
+                    batch_latents,
+                    batch_labels,
+                    lambda_val,
+                    dcfg,
+                    noise_scheduler=noise_scheduler,
+                    use_ilsd=(not args.no_ilsd),
                 )
 
             scaler.scale(loss_total).backward()
@@ -174,6 +187,7 @@ def main() -> None:
             torch.save(
                 {
                     "epoch": epoch,
+                    "config": dcfg,
                     "model": raw_state,
                     "optimizer": optimizer.state_dict(),
                     "step": global_step,

@@ -1,8 +1,9 @@
+from __future__ import annotations
+
 import glob
 import io
-import pandas as pd
+
 import torch
-from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -11,6 +12,8 @@ from elt.diffusion.vae import vae_encode
 
 class ImageNet100Dataset(Dataset):
     def __init__(self, data_dir: str, transform=None):
+        import pandas as pd
+
         parquet_files = sorted(glob.glob(f"{data_dir}/train-*.parquet"))
         if not parquet_files:
             raise FileNotFoundError(f"No train-*.parquet files found in {data_dir}")
@@ -23,6 +26,8 @@ class ImageNet100Dataset(Dataset):
         return len(self.df)
 
     def __getitem__(self, idx: int):
+        from PIL import Image
+
         row = self.df.iloc[idx]
         image_bytes = row["image"]["bytes"]
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
