@@ -15,6 +15,13 @@ ELT/
 │   ├── diffusion/          # Paper-complete DiT + adaLN-Zero + shifted cosine + v-pred + Sigmoid-ELBO
 │   ├── maskgit/            # Paper-complete class-conditional MaskGIT + VQGAN + CFG + STemp
 │   └── video/              # MAGVIT Causal 3D VQGAN + UCF-101 16x128x128 video ELT pipeline
+├── self_flow/              # Self-Flow (arXiv:2603.06507): official BFL inference + Dual-Timestep/EMA training
+│   ├── model.py            # SelfFlowPerTokenDiT (BFL checkpoint-compatible) & MultiModalSelfFlow
+│   ├── schedules.py        # Dual-Timestep Scheduling + uniform / shifted / (plateau-)logit-normal
+│   ├── losses.py           # Self-Flow L_gen + gamma * L_rep cosine alignment + EMATeacher
+│   ├── sampling.py         # SDE (250-step) & ODE (Euler/Heun + timeshift) samplers
+│   ├── sample.py           # Sampling CLI compatible with Hila/Self-Flow checkpoint
+│   └── train.py            # Self-Flow training CLI
 ├── scripts/
 │   ├── train_diffusion.py
 │   ├── visualize_diffusion.py

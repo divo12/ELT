@@ -176,7 +176,118 @@ def test_paper_complete() -> None:
         v_model, v_head, magvit, vcfg, n_loops=6, class_label=3, device=device
     )
     assert gen_vid.shape == (1, 3, 16, 128, 128) and torch.isfinite(gen_vid).all()
-    print(f"All paper-complete ELT checks passed on {device}!")
+
+    # 5. Self-Flow (arXiv:2603.06507 + BFL official repo): Dual-Timestep + EMA + SDE/ODE + Multi-Modal
+    from self_flow import (
+        EMATeacher,
+        MultiModalSelfFlow,
+        SelfFlowConfig,
+        SelfFlowPerTokenDiT,
+        denoise_loop,
+        dual_timestep_schedule,
+        multimodal_self_flow_step,
+        patchify_latents,
+        sample_timesteps,
+        self_flow_train_step,
+        unpatchify_latents,
+    )
+
+    for dist_name in ("uniform", "shifted_uniform", "logit_normal", "plateau_logit_normal"):
+        ts_sample = sample_timesteps((16,), dist=dist_name, shift_alpha=2.95, high_noise_prob=0.05, device=device)
+        assert ts_sample.shape == (16,) and bool(((ts_sample > 0.0) & (ts_sample < 1.0)).all())
+
+    sf_student = SelfFlowPerTokenDiT(
+        input_size=8,
+        patch_size=2,
+        in_channels=4,
+        hidden_size=64,
+        depth=6,
+        num_heads=4,
+        mlp_ratio=2.0,
+        num_classes=4,
+        class_dropout_prob=0.1,
+        learn_sigma=True,
+    ).to(device)
+    # Verify exact BFL checkpoint key compatibility
+    sd_keys = set(sf_student.state_dict())
+    for expected_key in (
+        "x_embedder.proj.weight",
+        "t_embedder.mlp.0.weight",
+        "y_embedder.embedding_table.weight",
+        "blocks.0.attn.qkv.weight",
+        "blocks.0.attn.proj.weight",
+        "blocks.0.mlp.fc1.weight",
+        "blocks.0.mlp.fc2.weight",
+        "blocks.0.adaLN_modulation.1.weight",
+        "final_layer.adaLN_modulation.1.weight",
+        "final_layer.linear.weight",
+        "projector.linear1.weight",
+        "projector.linear2.weight",
+    ):
+        assert expected_key in sd_keys, f"Missing BFL key: {expected_key}"
+
+    sf_ema = EMATeacher(sf_student, decay=0.99).to(device)
+    sf_cfg = SelfFlowConfig(mask_ratio=0.25, gamma=0.8, lr=3e-3)
+    sf_opt = torch.optim.AdamW(sf_student.parameters(), lr=sf_cfg.lr)
+
+    x_lat = torch.randn(4, 4, 8, 8, device=device)
+    assert torch.allclose(unpatchify_latents(patchify_latents(x_lat, 2), 2, 4), x_lat)
+    x_tok_proto = patchify_latents(x_lat, 2)
+
+    x_tau, x_tau_min, tau_vec, tau_min_vec, _ = dual_timestep_schedule(x_tok_proto, mask_ratio=0.25)
+    assert bool((tau_vec >= tau_min_vec.unsqueeze(1) - 1e-7).all()) and x_tau.shape == x_tau_min.shape
+
+    sf_losses = []
+    for _ in range(20):
+        lbl_sf = torch.randint(0, 4, (8,), device=device)
+        x0_sf = x_tok_proto[lbl_sf] + 0.02 * torch.randn(8, 16, 16, device=device)
+        out_sf = self_flow_train_step(sf_student, sf_ema, x0_sf, lbl_sf, sf_cfg)
+        sf_opt.zero_grad(set_to_none=True)
+        out_sf["loss"].backward()
+        sf_opt.step()
+        sf_ema.update(sf_student)
+        sf_losses.append(float(out_sf["loss"].item()))
+    assert sum(sf_losses[-4:]) < sum(sf_losses[:4]), "Self-Flow training loss failed to decrease"
+
+    sf_student.eval()
+    init_noise = torch.randn(4, 16, 16, device=device)
+    cfg_labels = torch.tensor([4, 4, 0, 1], device=device)  # [null, null, cond, cond]
+    sde_out = denoise_loop(
+        model=sf_student, num_steps=6, cfg_scale=1.5, mode="SDE", x=init_noise, vector=cfg_labels
+    )
+    ode_out = denoise_loop(
+        model=sf_student,
+        num_steps=6,
+        cfg_scale=1.5,
+        mode="ODE",
+        sampling_method="heun2",
+        sample_shift=1.78,
+        x=init_noise,
+        vector=cfg_labels,
+    )
+    assert sde_out.shape == (4, 16, 16) and torch.isfinite(sde_out).all()
+    assert ode_out.shape == (4, 16, 16) and torch.isfinite(ode_out).all()
+
+    # Multi-Modal Self-Flow (Appendix D: image + video + audio shared trunk)
+    mm_student = MultiModalSelfFlow(
+        modality_specs={"image": (16, 16), "video": (48, 32), "audio": (64, 20)},
+        hidden_size=64,
+        depth=6,
+        num_heads=4,
+        cond_dim=32,
+    ).to(device)
+    mm_ema = EMATeacher(mm_student, decay=0.99).to(device)
+    weights = {"image": 0.31, "video": 0.12, "audio": 0.57}
+    for mod, (dim_m, len_m) in (("image", (16, 16)), ("video", (48, 32)), ("audio", (64, 20))):
+        tok_m = torch.randn(2, len_m, dim_m, device=device)
+        cond_m = torch.randn(2, 32, device=device)
+        mm_out = multimodal_self_flow_step(
+            mm_student, mm_ema, tok_m, mod, sf_cfg, cond=cond_m, modality_weights=weights
+        )
+        mm_out["loss"].backward()
+        assert torch.isfinite(mm_out["loss"])
+
+    print(f"All paper-complete ELT & Self-Flow checks passed on {device}!")
 
 
 if __name__ == "__main__":
