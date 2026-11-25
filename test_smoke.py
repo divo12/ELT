@@ -204,8 +204,8 @@ def test_paper_complete() -> None:
         depth=6,
         num_heads=4,
         mlp_ratio=2.0,
-        num_classes=4,
-        class_dropout_prob=0.1,
+        num_classes=5,  # 4 real classes + 1 null CFG class (matching BFL num_classes=1001)
+        class_dropout_prob=0.0,
         learn_sigma=True,
     ).to(device)
     # Verify exact BFL checkpoint key compatibility

@@ -1,4 +1,4 @@
-"""Self-Flow Training Objective & EMA Teacher (arXiv:2603.06507 Section 3.4, Eq. 2, 6, 7 & App A.3/D)."""
+"""Self-Flow Training Objective & EMA Teacher (arXiv:2603.06507 Sec 3.4, App A.3/D & BFL Issues #7, #10)."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ class SelfFlowConfig:
     student_layer_ratio: float = 0.3
     teacher_layer_ratio: float = 0.7
     ema_decay: float = 0.9999
+    label_drop_prob: float = 0.1
 
     timestep_dist: TimestepDist = "uniform"
     train_shift: float = 1.0
@@ -39,7 +40,7 @@ class SelfFlowConfig:
 
 
 class EMATeacher(nn.Module):
-    """Momentum-updated Exponential Moving Average teacher network f_{theta'} (decay = 0.9999)."""
+    """Momentum-updated Exponential Moving Average teacher network f_{theta'} (decay = 0.9999, no warmup)."""
 
     def __init__(self, student: nn.Module, decay: float = 0.9999) -> None:
         super().__init__()
@@ -63,10 +64,11 @@ class EMATeacher(nn.Module):
 
 
 def cosine_alignment_loss(student_proj: Tensor, teacher_raw: Tensor) -> Tensor:
-    """Eq. 6: Negative token-wise cosine similarity -E[cos(h_theta^(l), sg(f_{theta'}^(k)))]."""
-    s_norm = F.normalize(student_proj.float(), dim=-1, eps=1e-8)
-    t_norm = F.normalize(teacher_raw.detach().float(), dim=-1, eps=1e-8)
-    return -(s_norm * t_norm).sum(dim=-1).mean()
+    """Eq. 6 + BFL Issue #7: 1 - CosineSimilarity(dim=-1) averaged over tokens & batch."""
+    cos_sim = F.cosine_similarity(
+        student_proj.float(), teacher_raw.detach().float(), dim=-1, eps=1e-8
+    )
+    return (1.0 - cos_sim).mean()
 
 
 def self_flow_train_step(
@@ -75,10 +77,23 @@ def self_flow_train_step(
     x0_tokens: Tensor,
     labels: Tensor,
     cfg: SelfFlowConfig,
+    null_class_id: int | None = None,
 ) -> dict[str, Tensor]:
-    """Full Self-Flow step (Eq. 2, Eq. 6, Eq. 7) on patched token sequence (B, N, C)."""
+    """Full Self-Flow step (Eq. 2, Eq. 6, Eq. 7) on patched token sequence (B, N, C).
+
+    Per BFL Issue #10, condition dropout is sampled once per sample and shared identically
+    between the student and the EMA teacher.
+    """
     raw_student = student.module if hasattr(student, "module") else student
     l_layer, k_layer = cfg.layer_indices(raw_student.depth)
+
+    if null_class_id is None:
+        null_class_id = raw_student.y_embedder.null_class_id
+
+    cond_labels = labels
+    if student.training and cfg.label_drop_prob > 0.0:
+        drop = torch.rand(labels.shape[0], device=labels.device) < cfg.label_drop_prob
+        cond_labels = torch.where(drop, null_class_id, labels)
 
     x1 = torch.randn_like(x0_tokens)
     target_velocity = x1 - x0_tokens
@@ -93,11 +108,11 @@ def self_flow_train_step(
     )
 
     v_pred, z_student = student(
-        x_tau, timesteps=tau, vector=labels, return_features=l_layer
+        x_tau, timesteps=tau, vector=cond_labels, return_features=l_layer
     )
     with torch.no_grad():
         _, z_teacher = ema_teacher(
-            x_tau_min, timesteps=tau_min, vector=labels, return_raw_features=k_layer
+            x_tau_min, timesteps=tau_min, vector=cond_labels, return_raw_features=k_layer
         )
 
     loss_gen = F.mse_loss(v_pred.float(), target_velocity.float())
@@ -124,6 +139,12 @@ def multimodal_self_flow_step(
     l_layer, k_layer = cfg.layer_indices(raw_student.depth)
     mask_ratio = MODALITY_MASK_RATIOS.get(modality, cfg.mask_ratio)
     high_noise = 0.05 if modality == "video" else cfg.high_noise_prob
+
+    if cond is not None and student.training and cfg.label_drop_prob > 0.0:
+        drop = (
+            torch.rand(cond.shape[0], device=cond.device) < cfg.label_drop_prob
+        ).view(cond.shape[0], *([1] * (cond.ndim - 1)))
+        cond = torch.where(drop, torch.zeros_like(cond), cond)
 
     x1 = torch.randn_like(x0_tokens)
     target_velocity = x1 - x0_tokens

@@ -117,8 +117,8 @@ def main() -> None:
         input_size=32,
         patch_size=2,
         in_channels=4,
-        num_classes=args.num_classes,
-        class_dropout_prob=0.1,
+        num_classes=args.num_classes + 1,  # +1 null class slot matching BFL selfflow_imagenet256.pt
+        class_dropout_prob=0.0,            # Synchronized student+teacher drop handled in self_flow_train_step
         learn_sigma=True,
     ).to(device)
     ema_teacher = EMATeacher(base_student, decay=sf_cfg.ema_decay).to(device)
